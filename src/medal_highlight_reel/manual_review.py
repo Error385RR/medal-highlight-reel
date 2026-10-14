@@ -13,7 +13,7 @@ except ImportError:  # Tk is optional for plan/render-only installations.
 from pathlib import Path
 from typing import Any
 
-from .ffmpeg_runner import RenderError, probe_media, resolve_executable
+from .ffmpeg_runner import RenderError, probe_media, resolve_executable, resolve_mpv_executable
 from .manual_timestamps import file_sha256, load_manual_records, save_manual_records
 from .report_reader import InputReportError, load_reports
 from .segment_planner import finite_number, _created_sort_key
@@ -107,9 +107,10 @@ def _lua_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
 
 
-def _write_mpv_script(path: Path, marks_path: Path, request_path: Path) -> None:
+def _write_mpv_script(path: Path, marks_path: Path, request_path: Path, navigation_path: Path) -> None:
     script = f'''local mark_path = {_lua_string(str(marks_path))}
 local request_path = {_lua_string(str(request_path))}
+local navigation_path = {_lua_string(str(navigation_path))}
 
 local function mark_position()
     local position = mp.get_property_number("time-pos")
@@ -128,7 +129,18 @@ local function mark_position()
     mp.osd_message(string.format("Manual bookmark marked at %.3f seconds", position), 2)
 end
 
+local function navigate(direction)
+    local file = io.open(navigation_path, "a")
+    if file then
+        file:write(direction .. "\\n")
+        file:flush()
+        file:close()
+    end
+end
+
 mp.add_forced_key_binding("m", "medal-highlight-mark", mark_position)
+mp.add_forced_key_binding("Ctrl+n", "medal-highlight-next", function() navigate("next") end)
+mp.add_forced_key_binding("Ctrl+p", "medal-highlight-previous", function() navigate("previous") end)
 mp.add_periodic_timer(0.1, function()
     local request = io.open(request_path, "r")
     if request then
@@ -165,9 +177,12 @@ class ManualReviewWindow:
         self.temp_path = Path(self.temporary.name)
         self.marks_path = self.temp_path / "marks.txt"
         self.request_path = self.temp_path / "mark.request"
+        self.navigation_path = self.temp_path / "navigation.txt"
         self.script_path = self.temp_path / "manual_mark.lua"
         self.marks_path.touch()
-        _write_mpv_script(self.script_path, self.marks_path, self.request_path)
+        self.navigation_path.touch()
+        self.navigation_offset = 0
+        _write_mpv_script(self.script_path, self.marks_path, self.request_path, self.navigation_path)
         self.read_offset = 0
         self._pending_navigation: int | None = None
 
@@ -180,7 +195,7 @@ class ManualReviewWindow:
         self.details.pack(fill="x", padx=16, pady=4)
         self.status = tk.Label(root, anchor="w", fg="#245a32")
         self.status.pack(fill="x", padx=16, pady=8)
-        instructions = tk.Label(root, text="Pause/seek in mpv, then press M in the player or click Mark current time.", anchor="w")
+        instructions = tk.Label(root, text="Pause/seek in mpv, press M to mark; Ctrl+N / Ctrl+P moves next / previous. N / P also works when this window is focused.", anchor="w")
         instructions.pack(fill="x", padx=16, pady=4)
         controls = tk.Frame(root)
         controls.pack(fill="x", padx=16, pady=10)
@@ -189,6 +204,8 @@ class ManualReviewWindow:
         tk.Button(controls, text="Skip", command=self.skip).pack(side="left", padx=4)
         tk.Button(controls, text="Next", command=lambda: self.navigate(1)).pack(side="left", padx=4)
         tk.Button(controls, text="Reopen mpv", command=self.start_player).pack(side="right")
+        root.bind("<KeyPress-n>", lambda _event: self.navigate(1))
+        root.bind("<KeyPress-p>", lambda _event: self.navigate(-1))
         self.show_current()
         self.root.after(150, self.poll_marks)
 
@@ -214,10 +231,11 @@ class ManualReviewWindow:
     def start_player(self) -> None:
         if self.index >= len(self.queue):
             return
-        self.stop_player()
+        if not self.stop_player():
+            return
         item = self.queue[self.index]
         try:
-            self.process = subprocess.Popen([self.mpv_bin, "--no-config", "--force-window=yes", "--keep-open=yes",
+            self.process = subprocess.Popen([self.mpv_bin, "--no-config", "--force-window=yes", "--autofit=30%x30%", "--keep-open=yes",
                                              f"--script={self.script_path}", "--", item["video_path"]],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.player_path = item["video_path"]
@@ -227,15 +245,29 @@ class ManualReviewWindow:
             self.process = None
             self.player_path = None
 
-    def stop_player(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+    def stop_player(self) -> bool:
+        process = self.process
+        if process is None or process.poll() is not None:
+            self.process = None
+            self.player_path = None
+            return True
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+                process.kill()
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                self.status.config(text="The previous mpv process did not close. The clip was not reopened; close mpv manually and try again.")
+                return False
+        except OSError as exc:
+            if process.poll() is None:
+                self.status.config(text=f"Could not close the previous mpv window: {exc}")
+                return False
         self.process = None
         self.player_path = None
+        return True
 
     def request_mark(self) -> None:
         if not self.process or self.process.poll() is not None:
@@ -252,6 +284,7 @@ class ManualReviewWindow:
 
     def poll_marks(self) -> None:
         self._drain_marks()
+        self._drain_navigation()
         if self.process and self.process.poll() is not None and self.index < len(self.queue):
             self.status.config(text="mpv is closed. Reopen it to continue marking this bookmark.")
         if self._pending_navigation is not None and (not self.request_path.exists()
@@ -264,6 +297,21 @@ class ManualReviewWindow:
             self._navigate_now(direction)
         if self.root.winfo_exists():
             self.root.after(150, self.poll_marks)
+
+    def _drain_navigation(self) -> None:
+        try:
+            with self.navigation_path.open("r", encoding="ascii") as stream:
+                stream.seek(self.navigation_offset)
+                lines = stream.readlines()
+                self.navigation_offset = stream.tell()
+        except OSError:
+            lines = []
+        for line in lines:
+            direction = line.strip()
+            if direction == "next":
+                self.navigate(1)
+            elif direction == "previous":
+                self.navigate(-1)
 
     def _drain_marks(self) -> None:
         try:
@@ -326,7 +374,8 @@ class ManualReviewWindow:
         self.navigate(1)
 
     def close(self) -> None:
-        self.stop_player()
+        if not self.stop_player():
+            return
         self.temporary.cleanup()
         self.root.destroy()
 
@@ -354,7 +403,7 @@ def run_manual_review(clips_path: Path, bookmarks_path: Path, output_path: Path,
         return len(corrections), len(skipped), skip_path
     if tk is None:
         raise ReviewError("this Python installation does not include Tkinter, which the manual review window needs")
-    mpv = resolve_executable(mpv_bin)
+    mpv = resolve_mpv_executable(mpv_bin)
     try:
         root = tk.Tk()
     except tk.TclError as exc:

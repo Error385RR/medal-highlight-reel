@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,8 +16,12 @@ try:
     import tkinter as tk
 except ImportError:  # Tk is optional for plan/render-only installations.
     tk = None  # type: ignore[assignment]
+if tk is not None:
+    from tkinter import messagebox
+else:
+    messagebox = None
 
-from .ffmpeg_runner import RenderError, probe_media, resolve_executable
+from .ffmpeg_runner import RenderError, probe_media, resolve_executable, resolve_mpv_executable
 from .segment_planner import finite_number
 
 
@@ -170,6 +175,8 @@ mp.add_forced_key_binding("Ctrl+LEFT", "refine-nudge-left", function() write_act
 mp.add_forced_key_binding("Ctrl+RIGHT", "refine-nudge-right", function() write_action("nudge_" .. active_boundary, "0.1") end)
 mp.add_forced_key_binding("Ctrl+Shift+LEFT", "refine-nudge-left-large", function() write_action("nudge_" .. active_boundary, "-1") end)
 mp.add_forced_key_binding("Ctrl+Shift+RIGHT", "refine-nudge-right-large", function() write_action("nudge_" .. active_boundary, "1") end)
+mp.add_forced_key_binding("Ctrl+n", "refine-next-segment", function() write_action("navigate_next") end)
+mp.add_forced_key_binding("Ctrl+p", "refine-previous-segment", function() write_action("navigate_previous") end)
 mp.add_periodic_timer(0.1, update_position)
 mp.add_periodic_timer(0.2, update_loop)
 '''
@@ -207,12 +214,12 @@ class RefinementWindow:
         self.player_segment: int | None = None
         self.temporary = tempfile.TemporaryDirectory(prefix="medal-highlight-refine-")
         self.temp_path = Path(self.temporary.name)
-        self.position_path = self.temp_path / "position.txt"
-        self.action_path = self.temp_path / "actions.txt"
-        self.loop_path = self.temp_path / "loop.txt"
-        self.script_path = self.temp_path / "refine.lua"
-        self.action_path.touch()
-        _write_player_script(self.script_path, self.position_path, self.action_path, self.loop_path)
+        self.player_session: Path | None = None
+        self.position_path: Path | None = None
+        self.action_path: Path | None = None
+        self.loop_path: Path | None = None
+        self.script_path: Path | None = None
+        self.session_number = 0
         self.action_offset = 0
 
         root.title("Medal Highlight Reel — Segment Refinement")
@@ -226,7 +233,7 @@ class RefinementWindow:
         self.position_label.pack(fill="x", padx=16, pady=4)
         self.status = tk.Label(root, anchor="w", fg="#245a32")
         self.status.pack(fill="x", padx=16, pady=5)
-        tk.Label(root, text=f"In mpv: A sets start, B sets end, S/E selects the boundary. Ctrl+Left/Right nudges by {step * 1000:g} ms; Ctrl+Shift+Left/Right uses {large_step:g} s.",
+        tk.Label(root, text=f"In mpv: A/B set boundaries, S/E selects one, Ctrl+Left/Right nudges by {step * 1000:g} ms, Ctrl+Shift+Left/Right uses {large_step:g} s, Ctrl+N/P changes segments. N/P works in this window.",
                  anchor="w", wraplength=740, justify="left").pack(fill="x", padx=16, pady=5)
         controls = tk.Frame(root)
         controls.pack(fill="x", padx=16, pady=8)
@@ -242,6 +249,7 @@ class RefinementWindow:
         tk.Button(controls2, text="Select end", command=lambda: self.select_boundary("end")).pack(side="left", padx=3)
         tk.Button(controls2, text="End −", command=lambda: self.nudge("end", -1, self.step)).pack(side="left", padx=3)
         tk.Button(controls2, text="End +", command=lambda: self.nudge("end", 1, self.step)).pack(side="left", padx=3)
+        tk.Button(controls2, text="Delete segment (D)", command=self.delete_segment).pack(side="left", padx=12)
         tk.Button(controls2, text="Next", command=lambda: self.navigate(1)).pack(side="right", padx=3)
         root.bind("<Left>", lambda _event: self.nudge(self.active_boundary, -1, self.step))
         root.bind("<Right>", lambda _event: self.nudge(self.active_boundary, 1, self.step))
@@ -254,6 +262,7 @@ class RefinementWindow:
         root.bind("<KeyPress-n>", lambda _event: self.navigate(1))
         root.bind("<KeyPress-p>", lambda _event: self.navigate(-1))
         root.bind("<KeyPress-r>", lambda _event: self.start_player())
+        root.bind("<KeyPress-d>", lambda _event: self.delete_segment())
         self.show_current()
         root.after(100, self.poll_player)
 
@@ -265,8 +274,12 @@ class RefinementWindow:
         segment = self.current()
         if segment is None:
             self.header.config(text="Refinement complete")
-            self.details.config(text=f"All {len(self.plan['segments'])} segment(s) reviewed.\nRefined plan: {self.output}")
-            self.status.config(text="The refined plan is ready to pass to the render command.")
+            deleted_count = len(self.plan["refinement"].get("deleted_segments", []))
+            self.details.config(text=f"All remaining {len(self.plan['segments'])} segment(s) reviewed; {deleted_count} segment(s) deleted.\nRefined plan: {self.output}")
+            if self.plan["segments"]:
+                self.status.config(text="The refined plan is ready to pass to the render command.")
+            else:
+                self.status.config(text="No segments remain, so there is nothing to render.")
             self.plan["refinement"]["status"] = "COMPLETE"
             self.save()
             self.stop_player()
@@ -283,18 +296,28 @@ class RefinementWindow:
         segment = self.current()
         if segment is None:
             return
-        self.stop_player()
+        if not self.stop_player():
+            return
         path = Path(segment["video_path"]).expanduser()
         self.position = float(segment["source_start_seconds"])
-        self.position_path.unlink(missing_ok=True)
         if not path.is_file():
             self.status.config(text=f"Source video is missing: {path}")
             return
         try:
             start = float(segment["source_start_seconds"])
             end = float(segment["source_end_seconds"])
+            self.session_number += 1
+            self.player_session = self.temp_path / f"player-{self.session_number:05d}"
+            self.player_session.mkdir()
+            self.position_path = self.player_session / "position.txt"
+            self.action_path = self.player_session / "actions.txt"
+            self.loop_path = self.player_session / "loop.txt"
+            self.script_path = self.player_session / "refine.lua"
+            self.action_path.touch()
+            _write_player_script(self.script_path, self.position_path, self.action_path, self.loop_path)
             _write_loop_bounds(self.loop_path, start, end)
-            self.process = subprocess.Popen([self.mpv, "--no-config", "--force-window=yes", "--keep-open=yes",
+            self.action_offset = 0
+            self.process = subprocess.Popen([self.mpv, "--no-config", "--force-window=yes", "--autofit=30%x30%", "--keep-open=yes",
                 f"--start={start:.9f}", f"--ab-loop-a={start:.9f}", f"--ab-loop-b={end:.9f}",
                 "--ab-loop-count=inf", f"--script={self.script_path}", "--", str(path)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -303,16 +326,44 @@ class RefinementWindow:
         except OSError as exc:
             self.status.config(text=f"Could not open mpv: {exc}")
             self.process = None
+            self._clear_player_session()
 
-    def stop_player(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-        self.process = None
+    def _clear_player_session(self) -> None:
+        if self.player_session is not None:
+            shutil.rmtree(self.player_session, ignore_errors=True)
+        self.player_session = None
+        self.position_path = None
+        self.action_path = None
+        self.loop_path = None
+        self.script_path = None
+
+    def stop_player(self) -> bool:
+        process = self.process
         self.player_segment = None
+        if process is None:
+            self._clear_player_session()
+            return True
+        if process.poll() is not None:
+            self.process = None
+            self._clear_player_session()
+            return True
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                self.status.config(text="The previous mpv process did not close. The clip was not reopened; try closing mpv manually, then press R again.")
+                return False
+        except OSError as exc:
+            if process.poll() is None:
+                self.status.config(text=f"Could not close the previous mpv window: {exc}")
+                return False
+        self.process = None
+        self._clear_player_session()
+        return True
 
     def select_boundary(self, boundary: str) -> None:
         self.active_boundary = boundary
@@ -339,11 +390,12 @@ class RefinementWindow:
         segment["refinement_status"] = "EDITED"
         self.active_boundary = boundary
         self.save()
-        try:
-            _write_loop_bounds(self.loop_path, start, end)
-        except OSError as exc:
-            self.status.config(text=f"Boundary saved, but could not update mpv's loop: {exc}")
-            return
+        if self.loop_path is not None:
+            try:
+                _write_loop_bounds(self.loop_path, start, end)
+            except OSError as exc:
+                self.status.config(text=f"Boundary saved, but could not update mpv's loop: {exc}")
+                return
         self.show_current()
         self.status.config(text=f"Saved {boundary} at {_format_time(position)}.")
 
@@ -362,6 +414,29 @@ class RefinementWindow:
         self.save()
         self.show_current()
 
+    def delete_segment(self) -> None:
+        segment = self.current()
+        if segment is None or messagebox is None:
+            return
+        segment_id = str(segment.get("segment_id", f"segment-{self.index + 1}"))
+        if not messagebox.askyesno("Delete segment", f"Remove {segment_id} from the refined plan?", parent=self.root):
+            return
+        if not self.stop_player():
+            return
+        from datetime import datetime, timezone
+        removed = copy.deepcopy(segment)
+        removed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.plan["refinement"].setdefault("deleted_segments", []).append(
+            {"deleted_at_utc": removed_at, "segment": removed})
+        del self.plan["segments"][self.index]
+        summary = self.plan.setdefault("summary", {})
+        summary["segments"] = len(self.plan["segments"])
+        summary["selected_bookmark_rows"] = sum(len(item.get("bookmarks", [])) for item in self.plan["segments"])
+        summary["merged_or_selected_clip_count"] = len({item.get("local_content_id", "") for item in self.plan["segments"]})
+        summary["deleted_segments"] = len(self.plan["refinement"]["deleted_segments"])
+        self.save()
+        self.show_current()
+
     def save(self) -> None:
         from datetime import datetime, timezone
         self.plan["refinement"]["last_saved_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -369,6 +444,8 @@ class RefinementWindow:
         _atomic_write(self.output, self.plan)
 
     def poll_position(self) -> None:
+        if self.position_path is None:
+            return
         try:
             value = finite_number(self.position_path.read_text(encoding="ascii").strip())
             if value is not None:
@@ -382,10 +459,13 @@ class RefinementWindow:
         if segment:
             self.position_label.config(text=f"Player: {_format_time(self.position)} ({self.position:.3f}s)    Active boundary: {self.active_boundary}")
         try:
-            with self.action_path.open("r", encoding="ascii") as stream:
-                stream.seek(self.action_offset)
-                actions = stream.readlines()
-                self.action_offset = stream.tell()
+            if self.action_path is None:
+                actions = []
+            else:
+                with self.action_path.open("r", encoding="ascii") as stream:
+                    stream.seek(self.action_offset)
+                    actions = stream.readlines()
+                    self.action_offset = stream.tell()
         except OSError:
             actions = []
         for line in actions:
@@ -403,12 +483,17 @@ class RefinementWindow:
                     self.nudge(action[6:], 1 if value >= 0 else -1, abs(value))
             elif action in {"select_start", "select_end"}:
                 self.select_boundary(action[7:])
+            elif action == "navigate_next":
+                self.navigate(1)
+            elif action == "navigate_previous":
+                self.navigate(-1)
         if self.process and self.process.poll() is not None and self.current() is not None:
             self.status.config(text="mpv is closed. Choose Reopen current clip or press R in this window.")
         self.root.after(100, self.poll_player)
 
     def close(self) -> None:
-        self.stop_player()
+        if not self.stop_player():
+            return
         self.temporary.cleanup()
         self.root.destroy()
 
@@ -421,11 +506,11 @@ def run_refinement(plan_path: Path, output_path: Path, mpv_bin: str = "mpv",
     plan_path = plan_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
     plan = _load_or_create(plan_path, output_path)
-    if not plan["segments"]:
+    if not plan["segments"] and not plan.get("refinement", {}).get("deleted_segments"):
         raise RefinementError("plan contains no segments to refine")
     if tk is None:
         raise RefinementError("this Python installation does not include Tkinter, which refinement needs")
-    mpv = resolve_executable(mpv_bin)
+    mpv = resolve_mpv_executable(mpv_bin)
     ffprobe = resolve_executable(ffprobe_bin)
     checked: set[str] = set()
     for index, segment in enumerate(plan["segments"], start=1):
