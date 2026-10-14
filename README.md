@@ -95,7 +95,7 @@ You can pass the original `plan.json` to `render` if you do not want to refine i
 
 Rendering checks the source files again and uses ffprobe to confirm each has a readable video stream and duration. Sources that disappeared or cannot be decoded are skipped and recorded in `highlight-reel_skipped.csv`. If none can be rendered, the command stops and points to that report. Existing outputs are protected; pass `--overwrite` to replace them.
 
-The renderer encodes each selected portion to a common H.264/AAC format before joining. This makes clips with different dimensions, frame rates, or audio layouts compatible, at the cost of re-encoding. Defaults are 1920x1080 at 30 fps; use `--width`, `--height`, and `--fps` to change them. Width and height must be even for the selected pixel format.
+The renderer encodes each selected portion to a common H.264/AAC format before joining. This makes clips with different dimensions, frame rates, or audio layouts compatible, at the cost of re-encoding. Defaults are 1920x1080 at 30 fps with H.264 CRF 20. Use `--width`, `--height`, and `--fps` to choose the output dimensions and frame rate; use `--crf` to choose encoding quality. Lower CRF values retain more visual detail and usually create larger files; 18 is a common higher-quality choice. The accepted CRF range is 0–51. Width and height must be even for the selected pixel format. For example, `--width 3840 --height 2160 --fps 60 --crf 18` requests 4K, 60 fps, higher-quality encoding, while using the originals' dimensions and frame rate avoids deliberately reducing those settings. Re-encoding and the fixed H.264/AAC output still mean this is not an exact copy of the source.
 
 ## Window configuration
 

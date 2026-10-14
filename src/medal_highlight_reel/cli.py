@@ -86,9 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--output", required=True, type=Path, help="Final .mp4 path")
     render.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg executable or path (default: ffmpeg on PATH)")
     render.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable or path (default: ffprobe on PATH)")
-    render.add_argument("--width", type=int, default=1920)
-    render.add_argument("--height", type=int, default=1080)
-    render.add_argument("--fps", type=int, default=30)
+    render.add_argument("--width", type=int, default=1920, help="Output width in pixels (default: 1920; must be even)")
+    render.add_argument("--height", type=int, default=1080, help="Output height in pixels (default: 1080; must be even)")
+    render.add_argument("--fps", type=int, default=30, help="Output frame rate (default: 30)")
+    render.add_argument("--crf", type=int, default=20,
+                        help="H.264 quality level from 0 to 51; lower means higher quality and larger files (default: 20)")
     render.add_argument("--overwrite", action="store_true", help="Replace existing MP4 and skipped report")
 
     review = subparsers.add_parser("review", help="Mark missing bookmark times in mpv and save corrections")
@@ -142,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote {summary['segments']} segment(s) to {output} (plan.json, segments.csv, rejected.csv)")
         elif args.command == "render":
             count, skipped, skipped_path = render_plan(args.plan, args.output, args.ffmpeg, args.ffprobe,
-                args.overwrite, args.width, args.height, args.fps)
+                args.overwrite, args.width, args.height, args.fps, args.crf)
             print(f"Rendered {count} segment(s) to {args.output}; skipped {len(skipped)}. Details: {skipped_path}")
         else:
             if args.command == "review":

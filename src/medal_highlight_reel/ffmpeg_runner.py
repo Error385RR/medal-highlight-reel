@@ -73,7 +73,8 @@ def _write_skips(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 def render_plan(plan_path: Path, output_path: Path, ffmpeg_bin: str = "ffmpeg", ffprobe_bin: str = "ffprobe",
-                overwrite: bool = False, width: int = 1920, height: int = 1080, fps: int = 30) -> tuple[int, list[dict[str, str]], Path]:
+                overwrite: bool = False, width: int = 1920, height: int = 1080, fps: int = 30,
+                crf: int = 20) -> tuple[int, list[dict[str, str]], Path]:
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -85,6 +86,8 @@ def render_plan(plan_path: Path, output_path: Path, ffmpeg_bin: str = "ffmpeg", 
         raise RenderError("plan has no segments to render")
     if width <= 0 or height <= 0 or fps <= 0:
         raise RenderError("output width, height, and frame rate must be positive integers")
+    if not 0 <= crf <= 51:
+        raise RenderError("H.264 CRF quality must be an integer from 0 to 51")
     if width % 2 or height % 2:
         raise RenderError("output width and height must be even numbers for yuv420p video")
     if any(not isinstance(segment, dict) for segment in segments):
@@ -160,7 +163,7 @@ def render_plan(plan_path: Path, output_path: Path, ffmpeg_bin: str = "ffmpeg", 
             command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.6f}",
                        "-i", str(source), *audio_input, "-t", f"{duration:.6f}", "-map", "0:v:0", "-map", audio_map,
                        "-vf", video_filter, "-af", audio_filter, "-c:v", "libx264", "-preset", "medium",
-                       "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                       "-crf", str(crf), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                        "-ac", "2", "-movflags", "+faststart", str(target)]
             try:
                 subprocess.run(command, capture_output=True, text=True, check=True)
