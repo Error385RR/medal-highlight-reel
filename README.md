@@ -8,7 +8,7 @@ This project does not read or modify Medal's database. It consumes the two CSV e
 
 - Python 3.11 or later
 - FFmpeg and ffprobe installed and available on `PATH` for rendering
-- mpv and Python's Tkinter module for manual bookmark review
+- mpv and Python's Tkinter module for manual bookmark review and segment refinement
 - The `clips.csv` and `bookmarks.csv` from a compatible `medal-audit extract` run
 
 ## Install
@@ -67,15 +67,31 @@ medal-highlights plan `
 
 Manual corrections are stored separately and labeled `MANUALLY_MARKED` in the plan. Each correction is tied to its bookmark row and a SHA-256 fingerprint of the exact bookmarks CSV. If that report changes, the project refuses to apply old marks to potentially different rows; review the updated report again.
 
+## Refine segment boundaries
+
+If a planned cut needs adjustment, refine a separate copy of `plan.json` before rendering:
+
+```powershell
+medal-highlights refine `
+  --plan .\highlight-plan\plan.json `
+  --output .\highlight-plan\refined-plan.json
+```
+
+The refinement window opens each source video at that segment's proposed start. You can seek anywhere in the full clip in mpv. The default fine adjustment is 100 ms; the larger keyboard nudge is 1 second. In mpv, **A** sets the start to the current playback time, **B** sets the end, **S/E** selects which boundary to nudge, **Ctrl+Left/Right** nudges that boundary by 100 ms, and **Ctrl+Shift+Left/Right** nudges it by 1 second. You can also focus the small control window and use its buttons or keyboard shortcuts. Start and end must stay within the source duration and start must remain before end.
+
+The refined JSON contains the complete plan and remains compatible with the renderer. It is written separately from the generated plan and atomically saved after each adjustment, so rerunning the same command with the same source and output resumes the saved work. If the source plan changes, choose a new output path rather than applying the old refinements to a different plan. To change the nudge sizes, use `--step-seconds 0.1 --large-step-seconds 1`.
+
 ## Render
 
 Review `segments.csv`, then render the plan:
 
 ```powershell
 medal-highlights render `
-  --plan .\highlight-plan\plan.json `
+  --plan .\highlight-plan\refined-plan.json `
   --output .\highlight-reel.mp4
 ```
+
+You can pass the original `plan.json` to `render` if you do not want to refine it.
 
 Rendering checks the source files again and uses ffprobe to confirm each has a readable video stream and duration. Sources that disappeared or cannot be decoded are skipped and recorded in `highlight-reel_skipped.csv`. If none can be rendered, the command stops and points to that report. Existing outputs are protected; pass `--overwrite` to replace them.
 
