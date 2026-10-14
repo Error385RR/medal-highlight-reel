@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medal-highlight-reel"
+version = "0.1.0"
+description = "Plan and render highlight reels from Medal clip and bookmark CSV reports"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+medal-highlights = "medal_highlight_reel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,20 @@
+{
+  "default": {
+    "before_seconds": 10,
+    "after_seconds": 5
+  },
+  "bookmarks": {
+    "Kill": {
+      "before_seconds": 6,
+      "after_seconds": 4
+    },
+    "4K": {
+      "before_seconds": 10,
+      "after_seconds": 8
+    },
+    "ACE": {
+      "before_seconds": 15,
+      "after_seconds": 12
+    }
+  }
+}
