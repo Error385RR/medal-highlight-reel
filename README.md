@@ -8,7 +8,7 @@ This project does not read or modify Medal's database. It consumes the two CSV e
 
 - Python 3.11 or later
 - FFmpeg and ffprobe installed and available on `PATH` for rendering
-- mpv and Python's Tkinter module for manual bookmark review
+- mpv and Python's Tkinter module for manual bookmark review and segment refinement
 - The `clips.csv` and `bookmarks.csv` from a compatible `medal-audit extract` run
 
 ## Install
@@ -43,7 +43,7 @@ Use `--preview` to calculate the plan and print counts without creating report f
 
 ## Manually mark missing bookmark times
 
-If the audit report has a bookmark with missing timing data but the source clip is playable, open the manual review queue:
+If the audit report has a bookmark with missing timing data but the source clip is playable, open the manual review queue. mpv opens at a size that fits within 30% of the screen width and height (while preserving the video's aspect ratio), and you can resize it freely:
 
 ```powershell
 medal-highlights review `
@@ -52,7 +52,7 @@ medal-highlights review `
   --output .\reports\manual-timestamps.csv
 ```
 
-The review window opens each eligible clip in mpv. Pause or seek to the event, then press **M** in mpv or click **Mark current time** in the review window. Marks save immediately; **Next**, **Previous**, and **Skip** let you move through the queue. Run the command again later to continue any unmarked rows. Only bookmarks marked `MISSING_TIMING_DATA` are queued. Missing/ambiguous clip records, absent files, invalid durations, and files without a readable video stream are listed in `manual-timestamps_review_skipped.csv`.
+The review window opens each eligible clip in mpv. Pause or seek to the event, then press **M** in mpv or click **Mark current time** in the review window. Marks save immediately; **Ctrl+N/Ctrl+P** in mpv or **N/P** while the review window is focused moves to the next/previous bookmark. **Next**, **Previous**, and **Skip** buttons also move through the queue. Run the command again later to continue any unmarked rows. Only bookmarks marked `MISSING_TIMING_DATA` are queued. Missing/ambiguous clip records, absent files, invalid durations, and files without a readable video stream are listed in `manual-timestamps_review_skipped.csv`.
 
 Use the saved correction file when creating the plan:
 
@@ -67,15 +67,31 @@ medal-highlights plan `
 
 Manual corrections are stored separately and labeled `MANUALLY_MARKED` in the plan. Each correction is tied to its bookmark row and a SHA-256 fingerprint of the exact bookmarks CSV. If that report changes, the project refuses to apply old marks to potentially different rows; review the updated report again.
 
+## Refine segment boundaries
+
+If a planned cut needs adjustment, refine a separate copy of `plan.json` before rendering:
+
+```powershell
+medal-highlights refine `
+  --plan .\highlight-plan\plan.json `
+  --output .\highlight-plan\refined-plan.json
+```
+
+The refinement window opens each source video at that segment's proposed start and loops playback between its proposed start and end. mpv opens at a size that fits within 30% of the screen width and height (while preserving the video's aspect ratio), and you can resize it freely. You can seek anywhere in the full clip in mpv to inspect surrounding context. The loop bounds update as you refine them. The default fine adjustment is 100 ms; the larger keyboard nudge is 1 second. In mpv, **A** sets the start to the current playback time, **B** sets the end, **S/E** selects which boundary to nudge, **Ctrl+Left/Right** nudges that boundary by 100 ms, **Ctrl+Shift+Left/Right** nudges it by 1 second, and **Ctrl+N/P** moves to the next/previous segment. **N/P** also navigates while the control window is focused. Use **Delete segment** or press **D** in the control window to remove the current segment after confirmation; removed entries are kept in the refined plan's deletion history while its active segment and bookmark totals are updated. The control window has a **Reopen current clip** button (or press **R** while that window is focused) if mpv is accidentally closed. Start and end must stay within the source duration and start must remain before end.
+
+The refined JSON contains the complete plan and remains compatible with the renderer. It is written separately from the generated plan and atomically saved after each adjustment, so rerunning the same command with the same source and output resumes the saved work. If the source plan changes, choose a new output path rather than applying the old refinements to a different plan. To change the nudge sizes, use `--step-seconds 0.1 --large-step-seconds 1`.
+
 ## Render
 
 Review `segments.csv`, then render the plan:
 
 ```powershell
 medal-highlights render `
-  --plan .\highlight-plan\plan.json `
+  --plan .\highlight-plan\refined-plan.json `
   --output .\highlight-reel.mp4
 ```
+
+You can pass the original `plan.json` to `render` if you do not want to refine it.
 
 Rendering checks the source files again and uses ffprobe to confirm each has a readable video stream and duration. Sources that disappeared or cannot be decoded are skipped and recorded in `highlight-reel_skipped.csv`. If none can be rendered, the command stops and points to that report. Existing outputs are protected; pass `--overwrite` to replace them.
 

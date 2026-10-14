@@ -13,6 +13,7 @@ from typing import Any
 from .ffmpeg_runner import RenderError, render_plan
 from .manual_review import ReviewError, run_manual_review
 from .report_reader import InputReportError
+from .refinement import RefinementError, run_refinement
 from .segment_planner import PlanError, create_plan, load_window_config
 
 
@@ -96,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--output", required=True, type=Path, help="Where to save resumable manual-timestamps.csv")
     review.add_argument("--mpv", default="mpv", help="mpv executable or path (default: mpv on PATH)")
     review.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable or path (default: ffprobe on PATH)")
+
+    refine = subparsers.add_parser("refine", help="Preview plan segments and adjust their source boundaries in mpv")
+    refine.add_argument("--plan", required=True, type=Path, help="plan.json created by the plan command")
+    refine.add_argument("--output", required=True, type=Path, help="Separate refined-plan JSON; reused to resume")
+    refine.add_argument("--mpv", default="mpv", help="mpv executable or path (default: mpv on PATH)")
+    refine.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable or path (default: ffprobe on PATH)")
+    refine.add_argument("--step-seconds", type=float, default=0.1, help="Fine nudge amount in seconds (default: 0.1)")
+    refine.add_argument("--large-step-seconds", type=float, default=1.0, help="Larger nudge amount in seconds (default: 1)")
     return parser
 
 
@@ -136,9 +145,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.overwrite, args.width, args.height, args.fps)
             print(f"Rendered {count} segment(s) to {args.output}; skipped {len(skipped)}. Details: {skipped_path}")
         else:
-            count, skipped, skipped_path = run_manual_review(args.clips, args.bookmarks, args.output, args.mpv, args.ffprobe)
-            print(f"Manual review finished: {count} saved mark(s), {skipped} bookmark row(s) unavailable. Details: {skipped_path}")
-    except (InputReportError, PlanError, RenderError, ReviewError, OSError, ValueError) as exc:
+            if args.command == "review":
+                count, skipped, skipped_path = run_manual_review(args.clips, args.bookmarks, args.output, args.mpv, args.ffprobe)
+                print(f"Manual review finished: {count} saved mark(s), {skipped} bookmark row(s) unavailable. Details: {skipped_path}")
+            else:
+                count, refined_path = run_refinement(args.plan, args.output, args.mpv, args.ffprobe,
+                                                     args.step_seconds, args.large_step_seconds)
+                print(f"Refinement finished: {count} segment(s) in {refined_path}")
+    except (InputReportError, PlanError, RenderError, ReviewError, RefinementError, OSError, ValueError) as exc:
         print(f"medal-highlights: {exc}", file=sys.stderr)
         return 2
     return 0

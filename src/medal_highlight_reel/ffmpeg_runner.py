@@ -25,6 +25,15 @@ def resolve_executable(value: str) -> str:
     raise RenderError(f"could not find executable {value!r}; install FFmpeg and ensure it is on PATH")
 
 
+def resolve_mpv_executable(value: str) -> str:
+    resolved = Path(resolve_executable(value))
+    if os.name == "nt" and resolved.suffix.casefold() in {".com", ""}:
+        gui_executable = resolved.with_suffix(".exe")
+        if gui_executable.is_file():
+            return str(gui_executable.resolve())
+    return str(resolved)
+
+
 def probe_media(ffprobe: str, path: Path) -> tuple[float, bool, bool]:
     try:
         result = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
