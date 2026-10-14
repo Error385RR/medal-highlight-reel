@@ -27,6 +27,8 @@ def read_csv(path: Path, required: set[str]) -> list[dict[str, str]]:
 def load_reports(clips_path: Path, bookmarks_path: Path) -> tuple[dict[str, dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
     clips = read_csv(clips_path, {"local_content_id", "video_path", "game", "clip_duration_seconds"})
     bookmarks = read_csv(bookmarks_path, {"local_content_id", "bookmark_name", "candidate_recovered_position_seconds", "position_status"})
+    for row_number, row in enumerate(bookmarks, start=1):
+        row["__source_row_number"] = str(row_number)
     index: dict[str, dict[str, str]] = {}
     duplicate_ids: set[str] = set()
     for row in clips:

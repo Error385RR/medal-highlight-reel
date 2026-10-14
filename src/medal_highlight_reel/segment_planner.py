@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .manual_timestamps import load_manual_records
 from .report_reader import InputReportError, load_reports
 
 
@@ -73,7 +74,8 @@ def _created_sort_key(value: str) -> tuple[int, str]:
 
 def create_plan(clips_path: Path, bookmarks_path: Path, config: dict[str, Any],
                 games: set[str] | None = None, bookmark_names: set[str] | None = None,
-                include_out_of_range: bool = False) -> tuple[dict[str, Any], list[dict[str, str]]]:
+                include_out_of_range: bool = False,
+                manual_timestamps_path: Path | None = None) -> tuple[dict[str, Any], list[dict[str, str]]]:
     try:
         clip_index, bookmark_rows, duplicate_clips = load_reports(clips_path, bookmarks_path)
     except InputReportError:
@@ -84,6 +86,25 @@ def create_plan(clips_path: Path, bookmarks_path: Path, config: dict[str, Any],
                         "video_path": row.get("video_path", ""), "reason": "duplicate_clip_id"})
     selected_games = {g.casefold() for g in games or set()}
     selected_names = {n.casefold() for n in bookmark_names or set()}
+    manual_records = load_manual_records(manual_timestamps_path, bookmarks_path)
+    bookmark_by_row = {int(row["__source_row_number"]): row for row in bookmark_rows}
+    manual_positions: dict[int, float] = {}
+    for row_number, record in manual_records.items():
+        bookmark = bookmark_by_row.get(row_number)
+        if (bookmark is None or bookmark.get("position_status", "").upper() != "MISSING_TIMING_DATA"
+                or bookmark.get("local_content_id", "") != record.get("local_content_id", "")
+                or bookmark.get("bookmark_name", "") != record.get("bookmark_name", "")):
+            raise PlanError(f"manual timestamp does not match a missing-timing bookmark at row {row_number}")
+        clip = clip_index.get(bookmark.get("local_content_id", ""))
+        if clip is None or clip.get("video_path", "") != record.get("video_path", ""):
+            raise PlanError(f"manual timestamp clip does not match bookmark row {row_number}")
+        if record.get("status") != "MANUALLY_MARKED":
+            raise PlanError(f"manual timestamp row {row_number} is not marked MANUALLY_MARKED")
+        position = finite_number(record.get("position_seconds"))
+        duration = finite_number(clip.get("clip_duration_seconds"))
+        if position is None or duration is None or duration <= 0 or position < 0 or position > duration:
+            raise PlanError(f"manual timestamp at row {row_number} is outside the clip duration or invalid")
+        manual_positions[row_number] = position
     eligible: list[dict[str, Any]] = []
     for bookmark in bookmark_rows:
         clip_id = bookmark.get("local_content_id", "")
@@ -109,18 +130,23 @@ def create_plan(clips_path: Path, bookmarks_path: Path, config: dict[str, Any],
                 reject("video_file_missing"); continue
         except (OSError, ValueError):
             reject("video_path_unreadable"); continue
+        row_number = int(bookmark["__source_row_number"])
         status = bookmark.get("position_status", "").strip().upper()
         if status == "MISSING_TIMING_DATA":
-            reject("missing_timing_data"); continue
+            if row_number not in manual_positions:
+                reject("missing_timing_data"); continue
+            effective_status = "MANUALLY_MARKED"
+        else:
+            effective_status = status
         if status == "OUT_OF_RANGE" and not include_out_of_range:
             reject("out_of_range"); continue
-        if status not in {"IN_RANGE", "OUT_OF_RANGE"}:
+        if effective_status not in {"IN_RANGE", "OUT_OF_RANGE", "MANUALLY_MARKED"}:
             reject("unsupported_position_status"); continue
-        position = finite_number(bookmark.get("candidate_recovered_position_seconds"))
+        position = manual_positions.get(row_number, finite_number(bookmark.get("candidate_recovered_position_seconds")))
         duration = finite_number(clip.get("clip_duration_seconds"))
         if position is None:
             reject("invalid_candidate_position"); continue
-        if position < 0 and not include_out_of_range:
+        if position < 0 and effective_status != "MANUALLY_MARKED" and not include_out_of_range:
             reject("position_before_clip_start"); continue
         if duration is None or duration <= 0:
             reject("missing_or_invalid_clip_duration"); continue
@@ -132,7 +158,9 @@ def create_plan(clips_path: Path, bookmarks_path: Path, config: dict[str, Any],
         if end <= start:
             reject("empty_segment_after_clamping"); continue
         eligible.append({"clip": clip, "clip_id": clip_id, "bookmark": bookmark, "name": name,
-                         "position": position, "duration": duration, "start": start, "end": end})
+                         "position": position, "position_status": effective_status,
+                         "manual_verification_status": "MANUALLY_VERIFIED" if effective_status == "MANUALLY_MARKED" else bookmark.get("manual_verification_status", "UNVERIFIED"),
+                         "duration": duration, "start": start, "end": end})
 
     eligible.sort(key=lambda e: (_created_sort_key(e["clip"].get("created_at_utc", "")),
                                  e["clip_id"], e["start"], e["end"]))
@@ -167,6 +195,7 @@ def create_plan(clips_path: Path, bookmarks_path: Path, config: dict[str, Any],
     plan = {"schema_version": 1, "segments": segments,
             "options": {"games": sorted(selected_games), "bookmark_names": sorted(selected_names),
                         "include_out_of_range": include_out_of_range,
+                        "manual_timestamps_used": bool(manual_records),
                         "window_defaults": config["default"], "bookmark_windows": config["bookmarks"]},
             "summary": {"segments": len(segments), "selected_bookmark_rows": len(eligible),
                         "merged_or_selected_clip_count": len({e["clip_id"] for e in eligible}),
@@ -177,6 +206,6 @@ def create_plan(clips_path: Path, bookmarks_path: Path, config: dict[str, Any],
 def event_record(event: dict[str, Any]) -> dict[str, Any]:
     bookmark = event["bookmark"]
     return {"name": event["name"], "candidate_position_seconds": round(event["position"], 6),
-            "position_status": bookmark.get("position_status", ""),
-            "manual_verification_status": bookmark.get("manual_verification_status", "UNVERIFIED"),
+            "position_status": event.get("position_status", bookmark.get("position_status", "")),
+            "manual_verification_status": event.get("manual_verification_status", bookmark.get("manual_verification_status", "UNVERIFIED")),
             "event_timestamp": bookmark.get("bookmark_timestamp", "")}

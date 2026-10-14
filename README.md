@@ -8,6 +8,7 @@ This project does not read or modify Medal's database. It consumes the two CSV e
 
 - Python 3.11 or later
 - FFmpeg and ffprobe installed and available on `PATH` for rendering
+- mpv and Python's Tkinter module for manual bookmark review
 - The `clips.csv` and `bookmarks.csv` from a compatible `medal-audit extract` run
 
 ## Install
@@ -39,6 +40,32 @@ This writes three review files:
 - `rejected.csv` lists bookmark rows not used, with a reason for each.
 
 Use `--preview` to calculate the plan and print counts without creating report files. Use `--before-seconds 8 --after-seconds 6` to override the default window for this run. Repeat `--game` or `--bookmark-name` to select more than one exact name; matching ignores letter case.
+
+## Manually mark missing bookmark times
+
+If the audit report has a bookmark with missing timing data but the source clip is playable, open the manual review queue:
+
+```powershell
+medal-highlights review `
+  --clips .\reports\clips.csv `
+  --bookmarks .\reports\bookmarks.csv `
+  --output .\reports\manual-timestamps.csv
+```
+
+The review window opens each eligible clip in mpv. Pause or seek to the event, then press **M** in mpv or click **Mark current time** in the review window. Marks save immediately; **Next**, **Previous**, and **Skip** let you move through the queue. Run the command again later to continue any unmarked rows. Only bookmarks marked `MISSING_TIMING_DATA` are queued. Missing/ambiguous clip records, absent files, invalid durations, and files without a readable video stream are listed in `manual-timestamps_review_skipped.csv`.
+
+Use the saved correction file when creating the plan:
+
+```powershell
+medal-highlights plan `
+  --clips .\reports\clips.csv `
+  --bookmarks .\reports\bookmarks.csv `
+  --manual-timestamps .\reports\manual-timestamps.csv `
+  --config .\config\windows.example.json `
+  --output-dir .\highlight-plan
+```
+
+Manual corrections are stored separately and labeled `MANUALLY_MARKED` in the plan. Each correction is tied to its bookmark row and a SHA-256 fingerprint of the exact bookmarks CSV. If that report changes, the project refuses to apply old marks to potentially different rows; review the updated report again.
 
 ## Render
 

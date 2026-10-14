@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .ffmpeg_runner import RenderError, render_plan
+from .manual_review import ReviewError, run_manual_review
 from .report_reader import InputReportError
 from .segment_planner import PlanError, create_plan, load_window_config
 
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--game", action="append", help="Keep only this game; repeat to select multiple")
     plan.add_argument("--bookmark-name", action="append", help="Keep only this bookmark name; repeat to select multiple")
     plan.add_argument("--include-out-of-range", action="store_true", help="Allow candidate positions marked OUT_OF_RANGE")
+    plan.add_argument("--manual-timestamps", type=Path, help="CSV of manually reviewed positions from the review command")
     plan.add_argument("--output-dir", required=True, type=Path, help="Directory for plan.json, segments.csv, and rejected.csv")
     plan.add_argument("--preview", action="store_true", help="Show planned and rejected counts without writing files")
     plan.add_argument("--overwrite", action="store_true", help="Replace existing plan files")
@@ -87,6 +89,13 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--height", type=int, default=1080)
     render.add_argument("--fps", type=int, default=30)
     render.add_argument("--overwrite", action="store_true", help="Replace existing MP4 and skipped report")
+
+    review = subparsers.add_parser("review", help="Mark missing bookmark times in mpv and save corrections")
+    review.add_argument("--clips", required=True, type=Path, help="Path to clips.csv")
+    review.add_argument("--bookmarks", required=True, type=Path, help="Path to bookmarks.csv")
+    review.add_argument("--output", required=True, type=Path, help="Where to save resumable manual-timestamps.csv")
+    review.add_argument("--mpv", default="mpv", help="mpv executable or path (default: mpv on PATH)")
+    review.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable or path (default: ffprobe on PATH)")
     return parser
 
 
@@ -96,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             config = load_window_config(args.config, args.before_seconds, args.after_seconds)
             plan, rejects = create_plan(args.clips, args.bookmarks, config,
-                set(args.game or []), set(args.bookmark_name or []), args.include_out_of_range)
+                set(args.game or []), set(args.bookmark_name or []), args.include_out_of_range,
+                args.manual_timestamps)
             summary = plan["summary"]
             if args.preview:
                 print(f"Preview: {summary['segments']} segment(s) from {summary['selected_bookmark_rows']} bookmark row(s); "
@@ -121,11 +131,14 @@ def main(argv: list[str] | None = None) -> int:
             reject_fields = ["local_content_id", "bookmark_name", "video_path", "reason"]
             _write_csv_atomic(outputs[2], rejects, reject_fields, args.overwrite)
             print(f"Wrote {summary['segments']} segment(s) to {output} (plan.json, segments.csv, rejected.csv)")
-        else:
+        elif args.command == "render":
             count, skipped, skipped_path = render_plan(args.plan, args.output, args.ffmpeg, args.ffprobe,
                 args.overwrite, args.width, args.height, args.fps)
             print(f"Rendered {count} segment(s) to {args.output}; skipped {len(skipped)}. Details: {skipped_path}")
-    except (InputReportError, PlanError, RenderError, OSError, ValueError) as exc:
+        else:
+            count, skipped, skipped_path = run_manual_review(args.clips, args.bookmarks, args.output, args.mpv, args.ffprobe)
+            print(f"Manual review finished: {count} saved mark(s), {skipped} bookmark row(s) unavailable. Details: {skipped_path}")
+    except (InputReportError, PlanError, RenderError, ReviewError, OSError, ValueError) as exc:
         print(f"medal-highlights: {exc}", file=sys.stderr)
         return 2
     return 0

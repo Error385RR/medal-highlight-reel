@@ -7,6 +7,8 @@ dist/
 venv/
 .test_tmp/
 /reports/
+manual-timestamps*.csv
+*_review_skipped.csv
 *.mp4
 *.mkv
 *.mov
