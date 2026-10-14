@@ -103,10 +103,13 @@ def _lua_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
 
 
-def _write_player_script(path: Path, position_path: Path, action_path: Path) -> None:
+def _write_player_script(path: Path, position_path: Path, action_path: Path, loop_path: Path) -> None:
     script = f'''local position_path = {_lua_string(str(position_path))}
 local action_path = {_lua_string(str(action_path))}
+local loop_path = {_lua_string(str(loop_path))}
 local active_boundary = "start"
+local last_loop_a = nil
+local last_loop_b = nil
 
 local function write_action(action, value)
     local position = mp.get_property_number("time-pos")
@@ -137,6 +140,28 @@ local function update_position()
     end
 end
 
+local function update_loop()
+    local file = io.open(loop_path, "r")
+    if not file then return end
+    local line = file:read("*l")
+    file:close()
+    if not line then return end
+    local raw_a, raw_b = line:match("^([%d%.]+),([%d%.]+)$")
+    local loop_a = tonumber(raw_a)
+    local loop_b = tonumber(raw_b)
+    if not loop_a or not loop_b or loop_b <= loop_a then return end
+    if loop_a ~= last_loop_a or loop_b ~= last_loop_b then
+        mp.set_property_number("ab-loop-a", loop_a)
+        mp.set_property_number("ab-loop-b", loop_b)
+        last_loop_a = loop_a
+        last_loop_b = loop_b
+        local position = mp.get_property_number("time-pos")
+        if position and (position < loop_a or position > loop_b) then
+            mp.commandv("seek", loop_a, "absolute+exact")
+        end
+    end
+end
+
 mp.add_forced_key_binding("a", "refine-set-start", function() write_action("set_start") end)
 mp.add_forced_key_binding("b", "refine-set-end", function() write_action("set_end") end)
 mp.add_forced_key_binding("s", "refine-select-start", function() active_boundary = "start"; write_action("select_start") end)
@@ -146,8 +171,15 @@ mp.add_forced_key_binding("Ctrl+RIGHT", "refine-nudge-right", function() write_a
 mp.add_forced_key_binding("Ctrl+Shift+LEFT", "refine-nudge-left-large", function() write_action("nudge_" .. active_boundary, "-1") end)
 mp.add_forced_key_binding("Ctrl+Shift+RIGHT", "refine-nudge-right-large", function() write_action("nudge_" .. active_boundary, "1") end)
 mp.add_periodic_timer(0.1, update_position)
+mp.add_periodic_timer(0.2, update_loop)
 '''
     path.write_text(script, encoding="utf-8")
+
+
+def _write_loop_bounds(path: Path, start: float, end: float) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(f"{start:.9f},{end:.9f}\n", encoding="ascii")
+    os.replace(temporary, path)
 
 
 def _format_time(seconds: float) -> str:
@@ -177,9 +209,10 @@ class RefinementWindow:
         self.temp_path = Path(self.temporary.name)
         self.position_path = self.temp_path / "position.txt"
         self.action_path = self.temp_path / "actions.txt"
+        self.loop_path = self.temp_path / "loop.txt"
         self.script_path = self.temp_path / "refine.lua"
         self.action_path.touch()
-        _write_player_script(self.script_path, self.position_path, self.action_path)
+        _write_player_script(self.script_path, self.position_path, self.action_path, self.loop_path)
         self.action_offset = 0
 
         root.title("Medal Highlight Reel — Segment Refinement")
@@ -198,6 +231,7 @@ class RefinementWindow:
         controls = tk.Frame(root)
         controls.pack(fill="x", padx=16, pady=8)
         tk.Button(controls, text="Previous segment", command=lambda: self.navigate(-1)).pack(side="left", padx=(0, 6))
+        tk.Button(controls, text="Reopen current clip (R)", command=self.start_player).pack(side="right", padx=3)
         tk.Button(controls, text="Set start here (A)", command=lambda: self.set_boundary("start")).pack(side="left", padx=3)
         tk.Button(controls, text="Set end here (B)", command=lambda: self.set_boundary("end")).pack(side="left", padx=3)
         tk.Button(controls, text="Start −", command=lambda: self.nudge("start", -1, self.step)).pack(side="left", padx=3)
@@ -209,7 +243,6 @@ class RefinementWindow:
         tk.Button(controls2, text="End −", command=lambda: self.nudge("end", -1, self.step)).pack(side="left", padx=3)
         tk.Button(controls2, text="End +", command=lambda: self.nudge("end", 1, self.step)).pack(side="left", padx=3)
         tk.Button(controls2, text="Next", command=lambda: self.navigate(1)).pack(side="right", padx=3)
-        tk.Button(controls2, text="Reopen mpv", command=self.start_player).pack(side="right", padx=3)
         root.bind("<Left>", lambda _event: self.nudge(self.active_boundary, -1, self.step))
         root.bind("<Right>", lambda _event: self.nudge(self.active_boundary, 1, self.step))
         root.bind("<Shift-Left>", lambda _event: self.nudge(self.active_boundary, -1, self.large_step))
@@ -220,6 +253,7 @@ class RefinementWindow:
         root.bind("<KeyPress-e>", lambda _event: self.select_boundary("end"))
         root.bind("<KeyPress-n>", lambda _event: self.navigate(1))
         root.bind("<KeyPress-p>", lambda _event: self.navigate(-1))
+        root.bind("<KeyPress-r>", lambda _event: self.start_player())
         self.show_current()
         root.after(100, self.poll_player)
 
@@ -257,11 +291,15 @@ class RefinementWindow:
             self.status.config(text=f"Source video is missing: {path}")
             return
         try:
+            start = float(segment["source_start_seconds"])
+            end = float(segment["source_end_seconds"])
+            _write_loop_bounds(self.loop_path, start, end)
             self.process = subprocess.Popen([self.mpv, "--no-config", "--force-window=yes", "--keep-open=yes",
-                f"--start={float(segment['source_start_seconds']):.9f}", f"--script={self.script_path}", "--", str(path)],
+                f"--start={start:.9f}", f"--ab-loop-a={start:.9f}", f"--ab-loop-b={end:.9f}",
+                "--ab-loop-count=inf", f"--script={self.script_path}", "--", str(path)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.player_segment = self.index
-            self.status.config(text="mpv opened at this segment's proposed start. Seek freely through the source clip.")
+            self.status.config(text="mpv opened at the segment start and will loop between its current start and end. Seek freely through the source clip.")
         except OSError as exc:
             self.status.config(text=f"Could not open mpv: {exc}")
             self.process = None
@@ -301,6 +339,11 @@ class RefinementWindow:
         segment["refinement_status"] = "EDITED"
         self.active_boundary = boundary
         self.save()
+        try:
+            _write_loop_bounds(self.loop_path, start, end)
+        except OSError as exc:
+            self.status.config(text=f"Boundary saved, but could not update mpv's loop: {exc}")
+            return
         self.show_current()
         self.status.config(text=f"Saved {boundary} at {_format_time(position)}.")
 
@@ -361,7 +404,7 @@ class RefinementWindow:
             elif action in {"select_start", "select_end"}:
                 self.select_boundary(action[7:])
         if self.process and self.process.poll() is not None and self.current() is not None:
-            self.status.config(text="mpv is closed. Use Reopen mpv to continue refining this segment.")
+            self.status.config(text="mpv is closed. Choose Reopen current clip or press R in this window.")
         self.root.after(100, self.poll_player)
 
     def close(self) -> None:
